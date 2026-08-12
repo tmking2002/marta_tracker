@@ -1,0 +1,443 @@
+import json
+import os
+ 
+from helpers import parse_delay_seconds
+ 
+atl_center = (33.7537, -84.3863)
+
+def write_static_layers(output_dir, line_shapes, stations, station_lines):
+    os.makedirs(output_dir, exist_ok=True)
+
+    lines_data = [{'line': name, 'coords': coords} for name, coords in line_shapes.items()]
+    stations_data = [{"name": clean_station_name(name), "lat": lat, "lon": lon, "lines": station_lines.get(parent_id, [])} for parent_id, name, lat, lon in stations]
+
+    with open(os.path.join(output_dir, 'lines.json'), 'w') as f:
+        json.dump(lines_data, f)
+
+    with open(os.path.join(output_dir, 'stations.json'), 'w') as f:
+        json.dump(stations_data, f)
+
+def clean_station_name(name):
+    name = name.strip()
+    if name.upper().endswith("STATION"):
+        name = name[: -len("STATION")].strip()
+    return name
+
+def write_trains(output_dir, train_records):
+    os.makedirs(output_dir, exist_ok=True)
+
+    trains_data = []
+    for train_id, record in train_records.items():
+        if not record.get('LATITUDE'):
+            continue
+
+        delay_seconds = parse_delay_seconds(record["DELAY"]) if record.get("DELAY") else 0
+        delay_label = f"{delay_seconds}s late" if delay_seconds >= 0 else f"{abs(delay_seconds)}s early"
+ 
+        trains_data.append({
+            "train_id": train_id,
+            "lat": float(record["LATITUDE"]),
+            "lon": float(record["LONGITUDE"]),
+            "line": record["LINE"],
+            "color": record['LINE'],
+            "direction": record['DIRECTION'],
+            "destination": record["DESTINATION"],
+            "station": record["STATION"],
+            "waiting_time": record["WAITING_TIME"],
+            "delay_seconds": delay_seconds,
+            "delay_label": delay_label,
+        })
+
+    with open(os.path.join(output_dir, 'trains.json'), 'w') as f:
+        json.dump(trains_data, f)
+
+
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>MARTA Live Train Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #f4f4f4;
+    }}
+    header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 20px;
+      background: #222;
+      color: #fff;
+    }}
+    header h1 {{
+      margin: 0;
+      font-size: 18px;
+    }}
+    #last-refresh {{
+      font-size: 13px;
+      color: #ccc;
+    }}
+    .dashboard {{
+      padding: 20px;
+      display: flex;
+      gap: 20px;
+    }}
+    .left-panel {{
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      padding-right: 20px;
+      border-right: 1px solid #ddd;
+    }}
+    .right-panel {{
+      flex: 2;
+      display: flex;
+      justify-content: center;
+    }}
+    .card {{
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+      overflow: hidden;
+    }}
+    .stat-card {{
+      width: 140px;
+      height: 140px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }}
+    .stat-label {{
+      font-size: 13px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }}
+    .stat-value {{
+      font-size: 32px;
+      font-weight: bold;
+      color: #222;
+      margin-top: 4px;
+    }}
+    #map {{
+      width: 100%;
+      height: 500px;
+    }}
+    .station-label {{
+      background: transparent;
+      border: none;
+      box-shadow: none;
+      padding: 0;
+      font-size: 11px;
+      font-weight: 600;
+      color: #333;
+      /* white halo so text stays legible over any tile color underneath */
+      text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff;
+    }}
+    .station-label::before {{
+      display: none;  /* hide Leaflet's default tooltip arrow */
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MARTA Live Train Map</h1>
+    <div id="last-refresh">Last refresh: --</div>
+  </header>
+  <div class="dashboard">
+    <div class="left-panel">
+      <div class="card stat-card">
+        <div class="stat-label">Trains Running</div>
+        <div class="stat-value" id="stat-total-trains">--</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">Running Late</div>
+        <div class="stat-value" id="stat-pct-late">--</div>
+      </div>
+    </div>
+    <div class="right-panel">
+      <div class="card" style="width: 100%;">
+        <div id="map"></div>
+      </div>
+    </div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const REFRESH_MS = {refresh_ms};
+    const map = L.map('map', {{
+      maxBoundsViscosity: 0.8,
+      zoomSnap: 0.25,      // fractional zoom steps instead of whole integers -> smooth, not jumpy
+      zoomDelta: 0.5,
+      wheelPxPerZoomLevel: 90,
+      preferCanvas: true,  // render vector shapes (lines, squares) to a single canvas, not many SVG DOM nodes
+    }}).setView([{center_lat}, {center_lon}], 11);
+    L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_nolabels/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+      attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+    }}).addTo(map);
+ 
+    // Converts a center point + a real-world half-size (in meters) into a
+    // lat/lon bounding box for L.rectangle. Longitude degrees shrink toward
+    // the poles, so the longitude delta is corrected by cos(latitude).
+    function squareBounds(lat, lon, halfSizeMeters) {{
+      const latDelta = halfSizeMeters / 111320;
+      const lonDelta = halfSizeMeters / (111320 * Math.cos(lat * Math.PI / 180));
+      return [[lat - latDelta, lon - lonDelta], [lat + latDelta, lon + lonDelta]];
+    }}
+ 
+    // Clicking a train isolates its line: every other line's polyline is
+    // hidden until the train is deselected (click it again, or click empty
+    // map). lineLayers holds each line's polyline so it can be toggled;
+    // selectedTrainId tracks the current selection (null = none).
+    const lineLayers = {{}};   // line name -> L.Polyline
+    let selectedTrainId = null;
+ 
+    // Station name labels only show once zoomed in enough that they're
+    // legible and don't all overlap each other.
+    const stationLayers = [];
+    const LABEL_MIN_ZOOM = 13;
+ 
+    function updateStationLabels() {{
+      const show = map.getZoom() >= LABEL_MIN_ZOOM;
+      for (const layer of stationLayers) {{
+        if (show) layer.openTooltip(); else layer.closeTooltip();
+      }}
+    }}
+ 
+    function applySelection() {{
+      const selectedTrain = selectedTrainId ? trainData[selectedTrainId] : null;
+      const selectedLine = selectedTrain ? selectedTrain.line : null;
+ 
+      for (const name in lineLayers) {{
+        const layer = lineLayers[name];
+        const shouldShow = !selectedLine || selectedLine === name;
+        if (shouldShow && !map.hasLayer(layer)) map.addLayer(layer);
+        if (!shouldShow && map.hasLayer(layer)) map.removeLayer(layer);
+      }}
+ 
+      for (const layer of stationLayers) {{
+        const shouldShow = !selectedLine || (layer.lines && layer.lines.includes(selectedLine));
+        if (shouldShow && !map.hasLayer(layer)) map.addLayer(layer);
+        if (!shouldShow && map.hasLayer(layer)) map.removeLayer(layer);
+      }}
+
+      // addLayer() on a permanent-tooltip layer re-opens its tooltip
+      // automatically, ignoring the current zoom level -- reassert the
+      // zoom-based label visibility every time selection changes.
+      updateStationLabels();
+ 
+      for (const id in trainMarkers) {{
+        const marker = trainMarkers[id];
+        const data = trainData[id];
+        const shouldShow = !selectedTrainId || id === selectedTrainId;
+        if (shouldShow && !map.hasLayer(marker)) map.addLayer(marker);
+        if (!shouldShow && map.hasLayer(marker)) map.removeLayer(marker);
+        // Re-render every visible train's icon so the selected one picks up
+        // its highlight ring.
+        if (shouldShow) marker.setIcon(trainIcon(data));
+      }}
+    }}
+ 
+    // Static layers: rail lines and station dots, drawn once on load. Also
+    // compute the system's real extent from these coordinates so the map
+    // can't be panned or zoomed out past the actual MARTA network.
+    Promise.all([
+      fetch('lines.json', {{cache: 'no-store'}}).then(r => r.json()),
+      fetch('stations.json', {{cache: 'no-store'}}).then(r => r.json()),
+    ]).then(([lines, stations]) => {{
+      const bounds = L.latLngBounds([]);
+ 
+      for (const line of lines) {{
+        lineLayers[line.line] = L.polyline(line.coords, {{color: line.line, weight: 4, opacity: 0.6}}).addTo(map);
+        line.coords.forEach(c => bounds.extend(c));
+      }}
+ 
+      for (const s of stations) {{
+        const stationLayer = L.rectangle(squareBounds(s.lat, s.lon, 60), {{
+          color: '#444444', weight: 1, fillColor: '#444444', fillOpacity: 0.8
+        }})
+          .addTo(map)
+          .bindPopup(s.name)
+          .bindTooltip(s.name, {{permanent: true, direction: 'top', offset: [0, -6], className: 'station-label'}});
+        stationLayer.lines = s.lines || [];  // used by applySelection() to filter by line
+        stationLayers.push(stationLayer);
+        bounds.extend([s.lat, s.lon]);
+      }}
+ 
+      const paddedBounds = bounds.pad(0.15);
+      map.setMaxBounds(paddedBounds);
+      map.setMinZoom(map.getBoundsZoom(paddedBounds));
+      map.fitBounds(bounds.pad(0.05));
+ 
+      updateStationLabels();
+      applySelection();  // in case a train was already selected before this data loaded
+    }});
+ 
+    // Live layer: train markers, updated in place on a timer. No page reload,
+    // so pan/zoom position and any open popups are never disturbed.
+    const trainMarkers = {{}};  // train_id -> L.Marker
+    const trainData = {{}};     // train_id -> last known record, for zoom-triggered icon rescaling
+ 
+    // MARTA's DIRECTION field is a coarse compass heading, not a precise
+    // bearing, but it's enough to show which way each train is headed.
+    const DIRECTION_ANGLES = {{N: 0, E: 90, S: 180, W: 270}};
+ 
+    // Grows/shrinks the train icon relative to the initial zoom level (11),
+    // so trains (like the meter-based station circles) visibly get bigger
+    // as you zoom in rather than staying a fixed pixel size.
+    function zoomScale() {{
+      const factor = Math.pow(1.25, map.getZoom() - 11);
+      return Math.max(0.5, Math.min(factor, 4));
+    }}
+ 
+    // Maps how early/late a train is to an outline color.
+    // - More than 30s early: green
+    // - Within 30s either direction ("roughly on time"): no outline at all
+    // - 30s to 3min late: yellow
+    // - 3min+ late: red
+    // Returns null for the no-outline case.
+    function delayColor(delaySeconds) {{
+      if (delaySeconds < -30) return '#2ecc71';
+      if (delaySeconds <= 30) return null;
+      if (delaySeconds <= 180) return '#f1c40f';
+      return '#e74c3c';
+    }}
+ 
+    function trainIcon(t) {{
+      const angle = DIRECTION_ANGLES[t.direction] ?? 0;
+      const isSelected = t.train_id === selectedTrainId;
+      const size = Math.round(22 * zoomScale() * (isSelected ? 1.3 : 1));
+      const half = size / 2;
+      const outline = delayColor(t.delay_seconds);
+      // No outline color means "roughly on time" -- use a thin border that
+      // matches the fill so the shape still has a clean edge, just no
+      // attention-grabbing ring.
+      const strokeColor = outline || t.color;
+      const strokeWidth = outline ? 2.5 : 1;
+      const highlightRing = isSelected
+        ? `<circle cx="12" cy="12" r="11.3" fill="none" stroke="#000" stroke-width="1.2" stroke-dasharray="2,1.5"/>`
+        : '';
+      const html = `<div style="transform: rotate(${{angle}}deg); width:${{size}}px; height:${{size}}px;">` +
+                   `<svg viewBox="0 0 24 24" width="${{size}}" height="${{size}}">` +
+                   highlightRing +
+                   `<circle cx="12" cy="12" r="10" fill="${{t.color}}" stroke="${{strokeColor}}" stroke-width="${{strokeWidth}}"/>` +
+                   `<polygon points="12,5 16,15 12,12 8,15" fill="white" stroke="#333" stroke-width="0.5"/>` +
+                   `</svg></div>`;
+      return L.divIcon({{className: '', html: html, iconSize: [size, size], iconAnchor: [half, half]}});
+    }}
+ 
+    function popupHtml(t) {{
+      const statusColor = delayColor(t.delay_seconds) || '#333';
+      return `<b>Train ${{t.train_id}}</b> (${{t.line}})<br>` +
+             `To ${{t.destination}}<br>` +
+             `Next: ${{t.station}} in ${{t.waiting_time}}<br>` +
+             `Status: <span style="color: ${{statusColor}}; font-weight: bold;">${{t.delay_label}}</span>`;
+    }}
+ 
+    async function refreshTrains() {{
+      let trains;
+      try {{
+        const res = await fetch('trains.json', {{cache: 'no-store'}});
+        trains = await res.json();
+      }} catch (err) {{
+        console.error('Failed to fetch trains.json', err);
+        return;
+      }}
+ 
+      document.getElementById('last-refresh').textContent =
+        'Last refresh: ' + new Date().toLocaleTimeString();
+ 
+      const totalTrains = trains.length;
+      const lateCount = trains.filter(t => t.delay_seconds > 30).length;
+      const pctLate = totalTrains ? Math.round((lateCount / totalTrains) * 100) : 0;
+      document.getElementById('stat-total-trains').textContent = totalTrains;
+      document.getElementById('stat-pct-late').textContent = pctLate + '%';
+ 
+      const seenIds = new Set();
+      for (const t of trains) {{
+        seenIds.add(t.train_id);
+        trainData[t.train_id] = t;
+        const latlng = [t.lat, t.lon];
+ 
+        if (trainMarkers[t.train_id]) {{
+          // Existing marker: move it, re-point its arrow, and refresh its
+          // popup content in place. If the popup happens to be open,
+          // setContent updates it live without closing it.
+          const marker = trainMarkers[t.train_id];
+          marker.setLatLng(latlng);
+          marker.setIcon(trainIcon(t));
+          const popup = marker.getPopup();
+          if (popup) popup.setContent(popupHtml(t));
+        }} else {{
+          const trainId = t.train_id;
+          const marker = L.marker(latlng, {{icon: trainIcon(t)}})
+            .addTo(map)
+            .bindPopup(popupHtml(t));
+          marker.on('click', (e) => {{
+            L.DomEvent.stopPropagation(e);  // don't let this bubble to the map's own click (which deselects)
+            selectedTrainId = (selectedTrainId === trainId) ? null : trainId;
+            applySelection();
+          }});
+          trainMarkers[trainId] = marker;
+        }}
+      }}
+ 
+      // Remove markers (and their cached data) for trains no longer in the feed
+      for (const id in trainMarkers) {{
+        if (!seenIds.has(id)) {{
+          map.removeLayer(trainMarkers[id]);
+          delete trainMarkers[id];
+          delete trainData[id];
+          if (id === selectedTrainId) {{
+            selectedTrainId = null;
+          }}
+        }}
+      }}
+ 
+      // Always re-apply, not just when a selection was cleared: a newly
+      // arrived train on a different line needs to stay hidden while a
+      // selection is active, rather than briefly flashing on the map.
+      applySelection();
+    }}
+ 
+    // Clicking empty map (not a train marker) clears the current selection
+    map.on('click', () => {{
+      if (selectedTrainId) {{
+        selectedTrainId = null;
+        applySelection();
+      }}
+    }});
+ 
+    // Rescale existing train icons and toggle station labels immediately on
+    // zoom, rather than waiting for the next poll cycle.
+    map.on('zoomend', () => {{
+      for (const id in trainMarkers) {{
+        trainMarkers[id].setIcon(trainIcon(trainData[id]));
+      }}
+      updateStationLabels();
+    }});
+ 
+    refreshTrains();
+    setInterval(refreshTrains, REFRESH_MS);
+  </script>
+</body>
+</html>
+"""
+
+def write_page(output_dir, refresh_seconds):
+    os.makedirs(output_dir, exist_ok=True)
+
+    html = PAGE_TEMPLATE.format(
+        refresh_ms=refresh_seconds * 1000,
+        center_lat=atl_center[0],
+        center_lon=atl_center[1],
+    )
+    with open(os.path.join(output_dir, "index.html"), "w") as f:
+        f.write(html)
+    
