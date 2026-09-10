@@ -178,7 +178,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       wheelPxPerZoomLevel: 90,
       preferCanvas: true,  // render vector shapes (lines, squares) to a single canvas, not many SVG DOM nodes
     }}).setView([{center_lat}, {center_lon}], 11);
-    L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_nolabels/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+    L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_nolabels/{{z}}/{{x}}/{{y}}{{r}}.png?key=cb1_3gf2_1_d21280f74dc76cd3dfd2cb49', {{
       attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
     }}).addTo(map);
  
