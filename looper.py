@@ -1,10 +1,11 @@
 import time
 import traceback
 
-from helpers import fetch_train_data, dedupe_trains
+from helpers import fetch_train_data, dedupe_trains, fetch_bus_positions
 from web_export import write_trains
+from db import insert_positions, insert_bus_positions
 
-def loop(api_key, interval_seconds, output_dir, iterations):
+def loop(api_key, interval_seconds, output_dir, iterations, conn, route_lookup=None):
     count = 0
 
     while iterations is None or count < iterations:
@@ -12,9 +13,20 @@ def loop(api_key, interval_seconds, output_dir, iterations):
             records = fetch_train_data(api_key)
             latest_trains = dedupe_trains(records)
             write_trains(output_dir, latest_trains)
-            print(f"[{count}] Updated {output_dir} with {len(latest_trains)} trains")
+
+            inserted = insert_positions(conn, latest_trains)
+            print(f"[{count}] Rail: updated {output_dir} with {len(latest_trains)} trains ({inserted} new rows logged)")
         except Exception as e:
-            print(f"[{count}] Loop failed: {e}")
+            print(f"[{count}] Rail loop failed: {e}")
+            traceback.print_exc()
+
+        try:
+            # Separate try/except from rail: the bus feed is a different host
+            bus_positions = fetch_bus_positions(route_lookup)
+            bus_inserted = insert_bus_positions(conn, bus_positions)
+            print(f"[{count}] Bus: saw {len(bus_positions)} vehicles ({bus_inserted} new rows logged)")
+        except Exception as e:
+            print(f"[{count}] Bus loop failed: {e}")
             traceback.print_exc()
 
         count += 1

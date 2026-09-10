@@ -1,13 +1,77 @@
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
+
+from google.transit import gtfs_realtime_pb2
 
 MARTA_RAIL_URL = "https://developerservices.itsmarta.com:18096/itsmarta/railrealtimearrivals/developerservices/traindata"
 
+# Bus feeds are public GTFS-realtime protobuf -- no API key needed, unlike rail.
+# NOTE: this is intentionally http://, not https://. MARTA's published docs
+# list an https:// URL, but that host's TLS setup is broken (confirmed both
+# by our own 403 and by other developers reporting SSL errors against it).
+# The https:// URL 301-redirects to this exact http:// URL anyway, so we
+# just go straight there and skip the broken hop.
+MARTA_BUS_VEHICLE_URL = "http://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/vehicle/"
+
+REQUEST_TIMEOUT = 15  # seconds -- fail fast instead of hanging indefinitely on a stalled connection
+
 def fetch_train_data(api_key):
-    response = requests.get(MARTA_RAIL_URL, params={"apiKey": api_key})
+    response = requests.get(MARTA_RAIL_URL, params={"apiKey": api_key}, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     return response.json()
+
+def load_bus_routes(routes):
+    """route_id -> human-readable route short name, for every route (bus + rail).
+    Bus route_ids are looked up against this when logging positions so you don't
+    have to join back to GTFS static data every time you want to know which
+    bus route a row belongs to."""
+    return {clean_id(row['route_id']): row['route_short_name'] for _, row in routes.iterrows()}
+
+def fetch_bus_positions(route_lookup=None):
+    """Pull the current snapshot of all active bus vehicle positions.
+
+    Returns a list of dicts, one per vehicle, already normalized to a shape
+    close to the rail records so the same db insert pattern works for both.
+    route_lookup is the dict from load_bus_routes(); if a route_id isn't
+    found there, route_name falls back to the raw route_id.
+    """
+    response = requests.get(MARTA_BUS_VEHICLE_URL, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(response.content)
+
+    route_lookup = route_lookup or {}
+    positions = []
+    for entity in feed.entity:
+        if not entity.HasField('vehicle'):
+            continue
+
+        v = entity.vehicle
+        if not v.HasField('position'):
+            continue
+
+        route_id = clean_id(v.trip.route_id) if v.HasField('trip') else None
+
+        positions.append({
+            "vehicle_id": v.vehicle.id or entity.id,
+            "trip_id": v.trip.trip_id if v.HasField('trip') else None,
+            "route_id": route_id,
+            "route_name": route_lookup.get(route_id, route_id),
+            "lat": v.position.latitude,
+            "lon": v.position.longitude,
+            "bearing": v.position.bearing if v.position.HasField('bearing') else None,
+            "speed": v.position.speed if v.position.HasField('speed') else None,
+            "current_stop_id": v.stop_id or None,
+            "current_stop_sequence": v.current_stop_sequence or None,
+            # GTFS-rt timestamps are unix epoch seconds -- convert to the same
+            # ISO string shape the rail side uses, so downstream code doesn't
+            # need to care which vehicle type a row came from.
+            "event_time": datetime.fromtimestamp(v.timestamp, tz=timezone.utc).isoformat() if v.timestamp else None,
+        })
+
+    return positions
 
 def parse_delay_seconds(delay_str):
     # strip leading T and trailing S
