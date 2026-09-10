@@ -18,7 +18,7 @@ def main():
     stop_times = pd.read_csv(f'{gtfs_dir}/stop_times.txt')
     shapes = pd.read_csv(f'{gtfs_dir}/shapes.txt')
 
-    api_key = os.environ.get('marta-api-key')
+    api_key = os.environ.get('MARTA_API_KEY')
     interval = 5
     output_dir = 'tracker_files'
     iterations = None  # this is now a data collector, not a demo -- run until stopped
