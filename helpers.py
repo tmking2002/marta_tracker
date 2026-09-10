@@ -26,7 +26,9 @@ def load_bus_routes(routes):
     Bus route_ids are looked up against this when logging positions so you don't
     have to join back to GTFS static data every time you want to know which
     bus route a row belongs to."""
-    return {clean_id(row['route_id']): row['route_short_name'] for _, row in routes.iterrows()}
+    r = routes.copy()
+    r['route_id'] = r['route_id'].astype(str).map(clean_id)
+    return dict(zip(r['route_id'], r['route_short_name']))
 
 def fetch_bus_positions(route_lookup=None):
     """Pull the current snapshot of all active bus vehicle positions.
@@ -103,99 +105,58 @@ def dedupe_trains(records):
     return latest
 
 def load_stations(stops):
-    stations = []
-    for _, stop in stops.iterrows():
-        if stop["location_type"] == 1 and 'RIDE' not in stop['stop_name']:
-            stations.append((clean_id(stop['stop_id']), stop["stop_name"], float(stop["stop_lat"]), float(stop["stop_lon"])))
-    return stations
+    s = stops[(stops["location_type"] == 1) & (~stops["stop_name"].str.contains('RIDE'))].copy()
+    s['stop_id'] = s['stop_id'].astype(str).map(clean_id)
+    return list(zip(s['stop_id'], s['stop_name'], s['stop_lat'].astype(float), s['stop_lon'].astype(float)))
 
 def load_station_lines(routes, trips, stops, stop_times):
 
-    route_to_line = {}
-    for _, route in routes.iterrows():
-        name = route['route_short_name'].upper()
-        if name in ['RED', 'GREEN', 'GOLD', 'BLUE']:
-            route_to_line[clean_id(route['route_id'])] = name
+    r = routes.copy()
+    r['line'] = r['route_short_name'].str.upper()
+    r = r[r['line'].isin(['RED', 'GREEN', 'GOLD', 'BLUE'])]
+    r['route_id'] = r['route_id'].astype(str).map(clean_id)
+    route_to_line = r[['route_id', 'line']]
 
-    trip_to_line = {}
-    for _, trip in trips.iterrows():
-        route_id = clean_id(trip['route_id'])
-        if route_id in route_to_line:
-            trip_to_line[clean_id(trip['trip_id'])] = route_to_line[route_id]
+    t = trips.copy()
+    t['route_id'] = t['route_id'].astype(str).map(clean_id)
+    t['trip_id'] = t['trip_id'].astype(str).map(clean_id)
+    trip_to_line = t.merge(route_to_line, on='route_id')[['trip_id', 'line']]
 
-    stop_to_parent = {}
-    for _, stop in stops.iterrows():
-        parent_id = clean_id(stop.get('parent_station', ''))
-        if parent_id and parent_id != 'nan':
-            stop_to_parent[clean_id(stop['stop_id'])] = parent_id
+    s = stops.copy()
+    s['stop_id'] = s['stop_id'].astype(str).map(clean_id)
+    s['parent_station'] = s['parent_station'].fillna('').astype(str).map(clean_id)
+    stop_to_parent = s[s['parent_station'].ne('') & s['parent_station'].ne('nan')][['stop_id', 'parent_station']]
 
-    station_lines = {}
-    for _, st in stop_times.iterrows():
-        line = trip_to_line.get(clean_id(st['trip_id']))
-        parent_id = stop_to_parent.get(clean_id(st['stop_id']))
+    st = stop_times.copy()
+    st['trip_id'] = st['trip_id'].astype(str).map(clean_id)
+    st['stop_id'] = st['stop_id'].astype(str).map(clean_id)
 
-        if not line or not parent_id:
-            continue
-
-        if parent_id not in station_lines:
-            station_lines[parent_id] = set()
-
-        station_lines[parent_id].add(line)
-
-    return {parent_id: sorted(lines) for parent_id, lines in station_lines.items()}
+    merged = st.merge(trip_to_line, on='trip_id').merge(stop_to_parent, on='stop_id')
+    grouped = merged.groupby('parent_station')['line'].agg(lambda x: sorted(set(x)))
+    return grouped.to_dict()
 
 def load_rail_lines(routes, trips, shapes):
 
-    # get the four route ids
-    route_to_line = {}
-    for _, route in routes.iterrows():
-        name = route['route_short_name'].upper()
- 
-        if name in ['RED', 'GREEN', 'GOLD', 'BLUE']:
-            route_to_line[route['route_id']] = name
- 
+    r = routes.copy()
+    r['line'] = r['route_short_name'].str.upper()
+    r = r[r['line'].isin(['RED', 'GREEN', 'GOLD', 'BLUE'])]
+    route_to_line = dict(zip(r['route_id'], r['line']))
+
     # each route has multiple trips (direction + schedule variations), just take the most common
-    shape_counts_by_route = {}
-    for _, trip in trips.iterrows():
-        route_id = trip['route_id']
- 
-        if route_id not in route_to_line:
-            continue
- 
-        if route_id not in shape_counts_by_route:
-            shape_counts_by_route[route_id] = {}
- 
-        shape_id = trip['shape_id']
- 
-        shape_counts_by_route[route_id][shape_id] = shape_counts_by_route[route_id].get(shape_id, 0) + 1
- 
-    # find the shape_id for each of the four routes
-    line_to_shape_id = {}
-    for route_id, counts in shape_counts_by_route.items():
-        line_name = route_to_line[route_id]
-        best_shape_id = max(counts, key=counts.get)
-        line_to_shape_id[line_name] = best_shape_id
- 
+    t = trips[trips['route_id'].isin(route_to_line.keys())].copy()
+    t['line'] = t['route_id'].map(route_to_line)
+    shape_counts = t.groupby(['line', 'shape_id']).size().reset_index(name='count')
+    best_idx = shape_counts.groupby('line')['count'].idxmax()
+    best_shape = shape_counts.loc[best_idx]
+    line_to_shape_id = dict(zip(best_shape['line'], best_shape['shape_id']))
+
     # collect the points for the four shape_ids
     necessary_shape_ids = set(line_to_shape_id.values())
-    points_by_shape = {}
-    for _, point in shapes.iterrows():
-        shape_id = point['shape_id']
- 
-        if shape_id in necessary_shape_ids:
- 
-            if shape_id not in points_by_shape:
-                points_by_shape[shape_id] = []
- 
-            points_by_shape[shape_id].append((
-                int(point["shape_pt_sequence"]),
-                float(point["shape_pt_lat"]),
-                float(point["shape_pt_lon"]),
-            ))
- 
+    filtered_shapes = shapes[shapes['shape_id'].isin(necessary_shape_ids)].sort_values(['shape_id', 'shape_pt_sequence'])
+
     line_shapes = {}
     for line_name, shape_id in line_to_shape_id.items():
-        ordered_points = sorted(points_by_shape[shape_id])
-        line_shapes[line_name] = [(lat, lon) for _, lat, lon in ordered_points]
- 
+        pts = filtered_shapes[filtered_shapes['shape_id'] == shape_id]
+        line_shapes[line_name] = list(zip(pts['shape_pt_lat'].astype(float), pts['shape_pt_lon'].astype(float)))
+
     return line_shapes
