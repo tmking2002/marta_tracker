@@ -9,6 +9,13 @@ BUS_POLL_INTERVAL_SECONDS = 30  # MARTA's bus feed only updates server-side abou
                                  # polling faster gained nothing and likely triggered rate-limiting/
                                  # blackholing on their end (same connect-timeout symptom either way).
 
+# Bus polling is disabled for now -- MARTA's gtfs-rt.itsmarta.com endpoint has
+# been unreachable on port 80 from both a home network and GCP's network, and
+# https:// 403s on that same host. Looks like a problem with their server, not
+# our setup. Rail collection is unaffected either way. Flip this back to True
+# to try bus polling again later.
+BUS_POLLING_ENABLED = False
+
 def loop(api_key, interval_seconds, output_dir, iterations, conn, route_lookup=None):
     count = 0
     last_bus_poll = 0  # forces a bus poll on the very first iteration
@@ -26,7 +33,7 @@ def loop(api_key, interval_seconds, output_dir, iterations, conn, route_lookup=N
             traceback.print_exc()
 
         now = time.time()
-        if now - last_bus_poll >= BUS_POLL_INTERVAL_SECONDS:
+        if BUS_POLLING_ENABLED and now - last_bus_poll >= BUS_POLL_INTERVAL_SECONDS:
             last_bus_poll = now
             try:
                 # Separate try/except from rail: the bus feed is a different host
